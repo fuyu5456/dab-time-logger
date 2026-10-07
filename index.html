@@ -134,7 +134,7 @@
 <body>
 <header>
   <div class="title">DAB 测试时间记录（竖屏）</div>
-  <div class="sub">导出 3 份 CSV：summary(总时长/总卡顿) + events(每次事件) + stutters(每次卡顿段)</div>
+  <div class="sub">单表导出：1 个 CSV 同时包含“总时长/总卡顿时长 + 每次事件 + 每次卡顿段信息”</div>
 </header>
 
 <div class="wrap">
@@ -159,12 +159,13 @@
       <button id="btnStutterStart" class="amber" disabled>卡顿开始</button>
       <button id="btnStutterEnd" class="blue" disabled>卡顿结束</button>
 
-      <button id="btnExport" class="secondary" disabled>导出 CSV</button>
+      <button id="btnExport" class="secondary" disabled>导出 CSV（单表）</button>
       <button id="btnNew" class="secondary">新建会话</button>
     </div>
 
     <div class="muted" style="margin-top:10px;">
-      说明：未结束时，总时长=START→当前时间（随导出时刻变化）。卡顿总时长只累计 PAIRED 段。
+      总时长：START→END；未结束则 START→导出时刻（实时显示也按当前时间滚动）。<br/>
+      总卡顿时长：只累计 PAIRED 的卡顿段。未配对事件仍会导出并标记。
     </div>
   </div>
 
@@ -181,7 +182,7 @@
 
   <div class="card">
     <details>
-      <summary>当前会话事件预览（含每次卡顿开始/结束）</summary>
+      <summary>当前会话事件预览</summary>
       <div id="preview" class="muted" style="margin-top:10px;"></div>
     </details>
   </div>
@@ -191,7 +192,7 @@
 
 <script>
 (() => {
-  const LS_KEY = "dab_time_logger_final_v1";
+  const LS_KEY = "dab_time_logger_one_table_v1";
   const $ = (id) => document.getElementById(id);
 
   const state = { current: null, isStutterOngoing: false, lastClickAt: 0 };
@@ -216,10 +217,7 @@
     });
   }
   function nowISO(){ return new Date().toISOString(); }
-  function toLocalTime(iso){
-    if(!iso) return "";
-    return new Date(iso).toLocaleString();
-  }
+  function toLocalTime(iso){ return iso ? new Date(iso).toLocaleString() : ""; }
   function stamp(dateISO) {
     const d = new Date(dateISO);
     const pad = (n) => String(n).padStart(2,'0');
@@ -263,63 +261,76 @@
     render();
   }
 
-  // 生成：每次卡顿事件配对信息 + 每次卡顿段
-  function pairStutters(events){
+  // 配对卡顿 + 生成“段”并把段信息挂到 start/end 事件上，便于单表导出
+  function buildStutterModel(events){
     const sorted = [...(events||[])].sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp));
-    const stack = [];
-    const eventPair = new Map(); // eventId -> {pairStatus, pairId}
-    const segments = [];         // 每次卡顿段（含未配对）
 
-    const markUnpaired = (ev) => eventPair.set(ev.eventId, {pairStatus:"UNPAIRED", pairId:""});
+    // eventId -> {pairStatus, pairId}
+    const eventPair = new Map();
+
+    // eventId -> {stutterId, stutterStatus, stutterDurationSeconds, stutterRole}
+    // stutterRole: START/END/ (空，非卡顿事件)
+    const eventStutter = new Map();
+
+    // 段列表（用于统计总卡顿等）
+    const segments = [];
+
+    const stack = [];
+
+    const markUnpaired = (ev, role) => {
+      eventPair.set(ev.eventId, {pairStatus:"UNPAIRED", pairId:""});
+      eventStutter.set(ev.eventId, {
+        stutterId: uuid(),
+        stutterStatus: role === "START" ? "UNPAIRED_START_ONLY" : "UNPAIRED_END_ONLY",
+        stutterDurationSeconds: "",
+        stutterRole: role
+      });
+    };
 
     for(const ev of sorted){
       if(ev.type === "STUTTER_START"){
         stack.push(ev);
-        markUnpaired(ev);
+        // 先临时标记 unpaired start；如果后续配对会覆盖
+        markUnpaired(ev, "START");
       } else if(ev.type === "STUTTER_END"){
         if(stack.length){
           const st = stack.pop();
+          const stutterId = uuid();
+          const duration = (new Date(ev.timestamp)-new Date(st.timestamp))/1000;
+
           eventPair.set(st.eventId, {pairStatus:"PAIRED", pairId: ev.eventId});
           eventPair.set(ev.eventId, {pairStatus:"PAIRED", pairId: st.eventId});
-          segments.push({
-            stutterId: uuid(),
-            startEventId: st.eventId,
-            endEventId: ev.eventId,
-            startTime: st.timestamp,
-            endTime: ev.timestamp,
-            durationSeconds: (new Date(ev.timestamp)-new Date(st.timestamp))/1000,
-            status: "PAIRED"
+
+          eventStutter.set(st.eventId, {
+            stutterId,
+            stutterStatus: "PAIRED",
+            stutterDurationSeconds: duration,
+            stutterRole: "START"
           });
+          eventStutter.set(ev.eventId, {
+            stutterId,
+            stutterStatus: "PAIRED",
+            stutterDurationSeconds: duration,
+            stutterRole: "END"
+          });
+
+          segments.push({ stutterId, durationSeconds: duration, status: "PAIRED" });
         } else {
-          markUnpaired(ev);
-          segments.push({
-            stutterId: uuid(),
-            startEventId: "",
-            endEventId: ev.eventId,
-            startTime: "",
-            endTime: ev.timestamp,
-            durationSeconds: "",
-            status: "UNPAIRED_END_ONLY"
-          });
+          // 孤立 END
+          markUnpaired(ev, "END");
+          segments.push({ stutterId: eventStutter.get(ev.eventId).stutterId, durationSeconds: "", status: "UNPAIRED_END_ONLY" });
         }
       }
     }
+
+    // 栈里剩余的 start 都是 UNPAIRED_START_ONLY（之前已经标记过）
     for(const st of stack){
-      markUnpaired(st);
-      segments.push({
-        stutterId: uuid(),
-        startEventId: st.eventId,
-        endEventId: "",
-        startTime: st.timestamp,
-        endTime: "",
-        durationSeconds: "",
-        status: "UNPAIRED_START_ONLY"
-      });
+      segments.push({ stutterId: eventStutter.get(st.eventId).stutterId, durationSeconds: "", status: "UNPAIRED_START_ONLY" });
     }
-    return { eventPair, segments, sorted };
+
+    return { sorted, eventPair, eventStutter, segments };
   }
 
-  // 总时长 + 总卡顿时长
   function computeTotals(session, segments, sortedEvents){
     const sorted = sortedEvents || (session.events||[]).slice().sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp));
     const startEv = sorted.find(e => e.type === "START");
@@ -327,12 +338,8 @@
 
     let totalDurationSeconds = "";
     if (startEv) {
-      if (endEv) {
-        totalDurationSeconds = (new Date(endEv.timestamp) - new Date(startEv.timestamp)) / 1000;
-      } else {
-        // 未结束：用当前时间作为结束时刻（你要求“要”）
-        totalDurationSeconds = (new Date() - new Date(startEv.timestamp)) / 1000;
-      }
+      if (endEv) totalDurationSeconds = (new Date(endEv.timestamp)-new Date(startEv.timestamp))/1000;
+      else totalDurationSeconds = (new Date() - new Date(startEv.timestamp))/1000; // 未结束：到当前时间
     }
 
     const totalStutterSeconds = segments
@@ -364,63 +371,68 @@
     URL.revokeObjectURL(url);
   }
 
-  // 导出最终结果：summary + events + stutters
-  function exportSession(session){
+  // 单表导出：每行是一个事件（包含每次卡顿开始/结束事件），并带上汇总字段
+  function exportSessionOneTable(session){
     const prefix = `${stamp(session.startedAt)}_${session.id.slice(0,8)}`;
 
-    const { eventPair, segments, sorted } = pairStutters(session.events);
+    const { sorted, eventPair, eventStutter, segments } = buildStutterModel(session.events);
     const totals = computeTotals(session, segments, sorted);
 
-    // 1) events：每次事件（包含每次卡顿开始/结束）
-    const eventRows = sorted.map(ev => {
-      const p = eventPair.get(ev.eventId) || {pairStatus:"",pairId:""};
+    const stutterCountPaired = segments.filter(s => s.status === "PAIRED").length;
+    const stutterCountUnpairedStartOnly = segments.filter(s => s.status === "UNPAIRED_START_ONLY").length;
+    const stutterCountUnpairedEndOnly = segments.filter(s => s.status === "UNPAIRED_END_ONLY").length;
+
+    const rows = sorted.map(ev => {
+      const p = eventPair.get(ev.eventId) || {pairStatus:"", pairId:""};
+      const st = eventStutter.get(ev.eventId) || {
+        stutterId:"",
+        stutterStatus:"",
+        stutterDurationSeconds:"",
+        stutterRole:""
+      };
+
       return {
+        // --- session summary fields (重复每行，方便Excel) ---
         sessionId: session.id,
+        startedAt: session.startedAt,
+        endedAt: session.endedAt || "",
+        totalDurationSeconds: totals.totalDurationSeconds,
+        totalStutterSeconds: totals.totalStutterSeconds,
+        stutterCountPaired,
+        stutterCountUnpairedStartOnly,
+        stutterCountUnpairedEndOnly,
+        eventCount: (session.events||[]).length,
+
+        // --- event fields (每次事件记录) ---
         eventId: ev.eventId,
-        type: ev.type,
-        timestamp: ev.timestamp,
+        eventType: ev.type,
+        eventTimestamp: ev.timestamp,
+
+        // --- pairing info (针对卡顿 start/end) ---
         pairStatus: p.pairStatus,
-        pairId: p.pairId
+        pairId: p.pairId,
+
+        // --- stutter segment info (如果该事件属于某段卡顿) ---
+        stutterId: st.stutterId,
+        stutterStatus: st.stutterStatus,
+        stutterRole: st.stutterRole, // START or END
+        stutterDurationSeconds: st.stutterDurationSeconds
       };
     });
-    const eventsCSV = toCSV(eventRows, ["sessionId","eventId","type","timestamp","pairStatus","pairId"]);
 
-    // 2) stutters：每次卡顿段（配对后有 duration，未配对有状态）
-    const stutterRows = segments.map(seg => ({
-      sessionId: session.id,
-      stutterId: seg.stutterId,
-      startEventId: seg.startEventId,
-      endEventId: seg.endEventId,
-      startTime: seg.startTime,
-      endTime: seg.endTime,
-      durationSeconds: seg.durationSeconds,
-      status: seg.status
-    }));
-    const stuttersCSV = toCSV(stutterRows, ["sessionId","stutterId","startEventId","endEventId","startTime","endTime","durationSeconds","status"]);
-
-    // 3) summary：总时长、总卡顿时长 + 计数
-    const summaryRows = [{
-      sessionId: session.id,
-      startedAt: session.startedAt,
-      endedAt: session.endedAt || "",
-      totalDurationSeconds: totals.totalDurationSeconds,
-      totalStutterSeconds: totals.totalStutterSeconds,
-      stutterCountPaired: segments.filter(s => s.status === "PAIRED").length,
-      stutterCountUnpairedStartOnly: segments.filter(s => s.status === "UNPAIRED_START_ONLY").length,
-      stutterCountUnpairedEndOnly: segments.filter(s => s.status === "UNPAIRED_END_ONLY").length,
-      eventCount: (session.events||[]).length
-    }];
-    const summaryCSV = toCSV(summaryRows, [
+    const header = [
       "sessionId","startedAt","endedAt",
       "totalDurationSeconds","totalStutterSeconds",
       "stutterCountPaired","stutterCountUnpairedStartOnly","stutterCountUnpairedEndOnly",
-      "eventCount"
-    ]);
+      "eventCount",
+      "eventId","eventType","eventTimestamp",
+      "pairStatus","pairId",
+      "stutterId","stutterStatus","stutterRole","stutterDurationSeconds"
+    ];
 
-    download(summaryCSV, `summary_${prefix}.csv`);
-    download(eventsCSV, `events_${prefix}.csv`);
-    download(stuttersCSV, `stutters_${prefix}.csv`);
-    toast("已导出：summary + events + stutters");
+    const csv = toCSV(rows, header);
+    download(csv, `dab_result_${prefix}.csv`);
+    toast("已导出 1 个 CSV（单表）");
   }
 
   function render(){
@@ -438,7 +450,7 @@
       kv.innerHTML = `<div class="kv"><div class="k">当前会话</div><div class="v">无</div></div>`;
     } else {
       const s = state.current;
-      const { segments, sorted } = pairStutters(s.events || []);
+      const { sorted, segments } = buildStutterModel(s.events || []);
       const totals = computeTotals(s, segments, sorted);
       const fmt = (x) => (x === "" ? "" : Number(x).toFixed(1));
 
@@ -459,7 +471,7 @@
     $("btnStutterEnd").disabled = !inSession;     // 允许孤立 END
     $("btnExport").disabled = !state.current;
 
-    // preview (last 12 events)
+    // preview
     const prev = $("preview");
     if(!state.current){
       prev.textContent = "无";
@@ -511,7 +523,7 @@
           toast(`已载入 Session ${s.id.slice(0,8)}`);
           render();
         } else if(act === "export"){
-          exportSession(s);
+          exportSessionOneTable(s);
         } else if(act === "delete"){
           if(confirm("确认删除该会话？不可恢复。")){
             deleteSession(id);
@@ -524,7 +536,7 @@
     });
   }
 
-  // button actions
+  // actions
   $("btnStart").onclick = () => { if(debounceClick()) startSession(); };
 
   $("btnEnd").onclick = () => {
@@ -537,7 +549,7 @@
 
   $("btnStutterStart").onclick = () => { if(debounceClick()) addEvent("STUTTER_START"); };
   $("btnStutterEnd").onclick = () => { if(debounceClick()) addEvent("STUTTER_END"); };
-  $("btnExport").onclick = () => { if(debounceClick() && state.current) exportSession(state.current); };
+  $("btnExport").onclick = () => { if(debounceClick() && state.current) exportSessionOneTable(state.current); };
 
   $("btnNew").onclick = () => {
     if(!debounceClick()) return;
@@ -563,10 +575,9 @@
     }
   };
 
-  // 初次渲染
   render();
 
-  // 可选：每 1 秒刷新一次总时长显示（仅在测试中）
+  // 每 1 秒刷新一次总时长显示（仅在测试中）
   setInterval(() => {
     if (state.current && !state.current.endedAt) render();
   }, 1000);
