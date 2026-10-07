@@ -5,14 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
   <title>DAB 测试时间记录</title>
 
-  <!-- PWA basics（可选，但加了更像App） -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
 
   <style>
     :root{
-      --bg:#0b1220;
-      --card:#111b2e;
       --text:#e8eefc;
       --muted:#a9b6d3;
       --line:rgba(255,255,255,.08);
@@ -58,7 +55,6 @@
     .kv .k{ color:var(--muted); font-size:12px; }
     .kv .v{ font-size:12px; text-align:right; }
 
-    /* Big buttons */
     .grid{
       display:grid;
       grid-template-columns: 1fr 1fr;
@@ -96,7 +92,6 @@
     .dot.on{ background:var(--green); }
     .dot.stutter{ background:var(--amber); }
 
-    /* toast */
     .toast{
       position:fixed;
       left:50%;
@@ -139,7 +134,7 @@
 <body>
 <header>
   <div class="title">DAB 测试时间记录（竖屏）</div>
-  <div class="sub">无定位版 · 本地保存 · 导出 events/stutters/summary 三份 CSV（含总时长与卡顿总时长）</div>
+  <div class="sub">导出 3 份 CSV：summary(总时长/总卡顿) + events(每次事件) + stutters(每次卡顿段)</div>
 </header>
 
 <div class="wrap">
@@ -169,8 +164,7 @@
     </div>
 
     <div class="muted" style="margin-top:10px;">
-      总时长规则：优先 START→END；若未结束，则 START→最后一个事件时间（或当前时间，若只有 START）。<br/>
-      卡顿总时长：只累计配对成功（PAIRED）的卡顿段。
+      说明：未结束时，总时长=START→当前时间（随导出时刻变化）。卡顿总时长只累计 PAIRED 段。
     </div>
   </div>
 
@@ -187,7 +181,7 @@
 
   <div class="card">
     <details>
-      <summary>当前会话事件预览</summary>
+      <summary>当前会话事件预览（含每次卡顿开始/结束）</summary>
       <div id="preview" class="muted" style="margin-top:10px;"></div>
     </details>
   </div>
@@ -197,14 +191,10 @@
 
 <script>
 (() => {
-  const LS_KEY = "dab_time_logger_sessions_v3";
+  const LS_KEY = "dab_time_logger_final_v1";
   const $ = (id) => document.getElementById(id);
 
-  const state = {
-    current: null,
-    isStutterOngoing: false,
-    lastClickAt: 0
-  };
+  const state = { current: null, isStutterOngoing: false, lastClickAt: 0 };
 
   function debounceClick(ms=350){
     const now = Date.now();
@@ -212,7 +202,6 @@
     state.lastClickAt = now;
     return true;
   }
-
   function toast(msg, ms=1400){
     const t = $("toast");
     t.textContent = msg;
@@ -220,45 +209,32 @@
     clearTimeout(toast._timer);
     toast._timer = setTimeout(()=> t.style.display="none", ms);
   }
-
   function uuid() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
       const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
   }
-
   function nowISO(){ return new Date().toISOString(); }
-
   function toLocalTime(iso){
     if(!iso) return "";
-    const d = new Date(iso);
-    return d.toLocaleString();
+    return new Date(iso).toLocaleString();
   }
-
   function stamp(dateISO) {
     const d = new Date(dateISO);
     const pad = (n) => String(n).padStart(2,'0');
     return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   }
 
-  function loadAll(){
-    try { return JSON.parse(localStorage.getItem(LS_KEY) || "[]"); }
-    catch { return []; }
-  }
+  function loadAll(){ try { return JSON.parse(localStorage.getItem(LS_KEY) || "[]"); } catch { return []; } }
   function saveAll(sessions){ localStorage.setItem(LS_KEY, JSON.stringify(sessions)); }
-
   function upsertSession(session){
     const sessions = loadAll();
     const idx = sessions.findIndex(x => x.id === session.id);
-    if (idx >= 0) sessions[idx] = session;
-    else sessions.push(session);
+    if (idx >= 0) sessions[idx] = session; else sessions.push(session);
     saveAll(sessions);
   }
-
-  function deleteSession(id){
-    saveAll(loadAll().filter(x => x.id !== id));
-  }
+  function deleteSession(id){ saveAll(loadAll().filter(x => x.id !== id)); }
 
   function startSession(){
     state.current = { id: uuid(), startedAt: nowISO(), endedAt: null, events: [] };
@@ -287,11 +263,12 @@
     render();
   }
 
+  // 生成：每次卡顿事件配对信息 + 每次卡顿段
   function pairStutters(events){
-    const sorted = [...events].sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp));
+    const sorted = [...(events||[])].sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp));
     const stack = [];
-    const eventPair = new Map();
-    const segments = [];
+    const eventPair = new Map(); // eventId -> {pairStatus, pairId}
+    const segments = [];         // 每次卡顿段（含未配对）
 
     const markUnpaired = (ev) => eventPair.set(ev.eventId, {pairStatus:"UNPAIRED", pairId:""});
 
@@ -339,29 +316,25 @@
         status: "UNPAIRED_START_ONLY"
       });
     }
-    return { eventPair, segments };
+    return { eventPair, segments, sorted };
   }
 
-  function computeTotals(session, segments){
-    const sorted = (session.events||[]).slice().sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp));
+  // 总时长 + 总卡顿时长
+  function computeTotals(session, segments, sortedEvents){
+    const sorted = sortedEvents || (session.events||[]).slice().sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp));
     const startEv = sorted.find(e => e.type === "START");
     const endEv = [...sorted].reverse().find(e => e.type === "END");
 
-    // 总时长：优先 START->END；否则 START->最后一个事件；如果只有 START 就 START->当前时间
     let totalDurationSeconds = "";
     if (startEv) {
       if (endEv) {
         totalDurationSeconds = (new Date(endEv.timestamp) - new Date(startEv.timestamp)) / 1000;
       } else {
-        const lastEv = sorted[sorted.length - 1];
-        const endLike = lastEv ? new Date(lastEv.timestamp) : new Date();
-        // 若只有 START，lastEv 就是 START，此时用当前时间更符合“进行中”
-        const useEnd = (sorted.length <= 1) ? new Date() : endLike;
-        totalDurationSeconds = (useEnd - new Date(startEv.timestamp)) / 1000;
+        // 未结束：用当前时间作为结束时刻（你要求“要”）
+        totalDurationSeconds = (new Date() - new Date(startEv.timestamp)) / 1000;
       }
     }
 
-    // 卡顿总时长：只累计配对成功
     const totalStutterSeconds = segments
       .filter(s => s.status === "PAIRED" && typeof s.durationSeconds === "number")
       .reduce((sum, s) => sum + s.durationSeconds, 0);
@@ -391,14 +364,14 @@
     URL.revokeObjectURL(url);
   }
 
+  // 导出最终结果：summary + events + stutters
   function exportSession(session){
     const prefix = `${stamp(session.startedAt)}_${session.id.slice(0,8)}`;
-    const { eventPair, segments } = pairStutters(session.events);
-    const { totalDurationSeconds, totalStutterSeconds } = computeTotals(session, segments);
 
-    const sorted = (session.events||[]).slice().sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp));
+    const { eventPair, segments, sorted } = pairStutters(session.events);
+    const totals = computeTotals(session, segments, sorted);
 
-    // events csv
+    // 1) events：每次事件（包含每次卡顿开始/结束）
     const eventRows = sorted.map(ev => {
       const p = eventPair.get(ev.eventId) || {pairStatus:"",pairId:""};
       return {
@@ -412,7 +385,7 @@
     });
     const eventsCSV = toCSV(eventRows, ["sessionId","eventId","type","timestamp","pairStatus","pairId"]);
 
-    // stutters csv
+    // 2) stutters：每次卡顿段（配对后有 duration，未配对有状态）
     const stutterRows = segments.map(seg => ({
       sessionId: session.id,
       stutterId: seg.stutterId,
@@ -425,13 +398,13 @@
     }));
     const stuttersCSV = toCSV(stutterRows, ["sessionId","stutterId","startEventId","endEventId","startTime","endTime","durationSeconds","status"]);
 
-    // summary csv（新增：总时长+卡顿总时长）
+    // 3) summary：总时长、总卡顿时长 + 计数
     const summaryRows = [{
       sessionId: session.id,
       startedAt: session.startedAt,
       endedAt: session.endedAt || "",
-      totalDurationSeconds: totalDurationSeconds,
-      totalStutterSeconds: totalStutterSeconds,
+      totalDurationSeconds: totals.totalDurationSeconds,
+      totalStutterSeconds: totals.totalStutterSeconds,
       stutterCountPaired: segments.filter(s => s.status === "PAIRED").length,
       stutterCountUnpairedStartOnly: segments.filter(s => s.status === "UNPAIRED_START_ONLY").length,
       stutterCountUnpairedEndOnly: segments.filter(s => s.status === "UNPAIRED_END_ONLY").length,
@@ -444,30 +417,29 @@
       "eventCount"
     ]);
 
+    download(summaryCSV, `summary_${prefix}.csv`);
     download(eventsCSV, `events_${prefix}.csv`);
     download(stuttersCSV, `stutters_${prefix}.csv`);
-    download(summaryCSV, `summary_${prefix}.csv`);
-    toast("已导出 3 份 CSV（events / stutters / summary）");
+    toast("已导出：summary + events + stutters");
   }
 
   function render(){
     const inSession = !!state.current && !state.current.endedAt;
 
-    // state pills
     $("dot").className = "dot" + (inSession ? " on" : "");
     $("stateText").textContent = inSession ? "测试中" : (state.current ? "已结束" : "未开始");
 
     $("dotSt").className = "dot" + (state.isStutterOngoing ? " stutter" : "");
     $("stText").textContent = state.isStutterOngoing ? "卡顿中" : "未卡顿";
 
-    // session kv (include live totals preview)
+    // session kv + 实时汇总预览
     const kv = $("sessionKV");
     if(!state.current){
       kv.innerHTML = `<div class="kv"><div class="k">当前会话</div><div class="v">无</div></div>`;
     } else {
       const s = state.current;
-      const { segments } = pairStutters(s.events || []);
-      const totals = computeTotals(s, segments);
+      const { segments, sorted } = pairStutters(s.events || []);
+      const totals = computeTotals(s, segments, sorted);
       const fmt = (x) => (x === "" ? "" : Number(x).toFixed(1));
 
       kv.innerHTML = `
@@ -484,10 +456,10 @@
     $("btnStart").disabled = inSession;
     $("btnEnd").disabled = !inSession;
     $("btnStutterStart").disabled = !inSession || state.isStutterOngoing;
-    $("btnStutterEnd").disabled = !inSession; // allow unpaired end
+    $("btnStutterEnd").disabled = !inSession;     // 允许孤立 END
     $("btnExport").disabled = !state.current;
 
-    // preview
+    // preview (last 12 events)
     const prev = $("preview");
     if(!state.current){
       prev.textContent = "无";
@@ -552,7 +524,7 @@
     });
   }
 
-  // buttons actions
+  // button actions
   $("btnStart").onclick = () => { if(debounceClick()) startSession(); };
 
   $("btnEnd").onclick = () => {
@@ -591,7 +563,13 @@
     }
   };
 
+  // 初次渲染
   render();
+
+  // 可选：每 1 秒刷新一次总时长显示（仅在测试中）
+  setInterval(() => {
+    if (state.current && !state.current.endedAt) render();
+  }, 1000);
 })();
 </script>
 </body>
